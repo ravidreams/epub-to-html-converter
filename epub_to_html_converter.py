@@ -1,6 +1,7 @@
 import os
 import logging
 import ebooklib
+import base64
 from ebooklib import epub
 from bs4 import BeautifulSoup
 import re
@@ -30,11 +31,49 @@ class EPUBToHTMLConverter:
         
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'images'), exist_ok=True)
         
         # Book object
         self.book = None
         self.chapters = []
+        self.images = {}
         
+    def _save_images(self):
+        """Extract and save images from EPUB"""
+        for item in self.book.get_items():
+            if item.get_type() == ebooklib.ITEM_IMAGE:
+                try:
+                    # Create subdirectories if needed
+                    image_name = item.get_name()
+                    image_dir = os.path.dirname(image_name)
+                    if image_dir:
+                        full_image_dir = os.path.join(self.output_dir, 'images', image_dir)
+                        os.makedirs(full_image_dir, exist_ok=True)
+                    
+                    image_path = os.path.join('images', image_name)
+                    full_path = os.path.join(self.output_dir, image_path)
+                    with open(full_path, 'wb') as f:
+                        f.write(item.get_content())
+                    self.images[image_name] = image_path
+                    logger.info(f"Saved image: {image_path}")
+                except Exception as e:
+                    logger.error(f"Error saving image {image_name}: {str(e)}")
+
+    def _process_images_in_content(self, content):
+        """Process images in HTML content"""
+        soup = BeautifulSoup(content, 'html.parser')
+        for img in soup.find_all('image'):
+            href = img.get('xlink:href')
+            if href and href in self.images:
+                img['xlink:href'] = '../' + self.images[href]
+        
+        for img in soup.find_all('img'):
+            src = img.get('src')
+            if src and src in self.images:
+                img['src'] = '../' + self.images[src]
+        
+        return str(soup)
+
     def _create_stylesheet(self):
         """Create a CSS file for styling"""
         css_content = """
@@ -104,6 +143,14 @@ class EPUBToHTMLConverter:
             text-align: center;
             margin-bottom: 30px;
         }
+        .cover-image {
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 0 auto;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
         """
         css_path = os.path.join(self.output_dir, 'style.css')
         with open(css_path, 'w', encoding='utf-8') as f:
@@ -112,7 +159,7 @@ class EPUBToHTMLConverter:
 
     def _create_navigation(self, current_index, total_chapters):
         """Create navigation links"""
-        prev_link = f'chapter_{current_index:03d}.html' if current_index > 1 else 'index.html'
+        prev_link = f'chapter_{current_index-1:03d}.html' if current_index > 1 else 'index.html'
         next_link = f'chapter_{current_index+1:03d}.html' if current_index < total_chapters else 'index.html'
         
         nav_html = f'''
@@ -124,7 +171,22 @@ class EPUBToHTMLConverter:
         '''
         return nav_html
 
-    def _create_toc(self, chapters):
+    def _extract_cover(self):
+        """Extract cover image from EPUB"""
+        try:
+            for item in self.book.get_items():
+                if isinstance(item, epub.EpubCover) or item.get_name().lower().endswith(('cover.jpg', 'cover.jpeg', 'cover.png')):
+                    cover_path = os.path.join('images', 'cover' + os.path.splitext(item.get_name())[1])
+                    full_path = os.path.join(self.output_dir, cover_path)
+                    with open(full_path, 'wb') as f:
+                        f.write(item.get_content())
+                    logger.info(f"Extracted cover image: {cover_path}")
+                    return cover_path
+        except Exception as e:
+            logger.error(f"Error extracting cover: {str(e)}")
+        return None
+
+    def _create_toc(self, chapters, cover_path=None):
         """Create table of contents page"""
         toc_html = f'''
         <!DOCTYPE html>
@@ -137,6 +199,16 @@ class EPUBToHTMLConverter:
         </head>
         <body>
             <div class="toc">
+        '''
+        
+        if cover_path:
+            toc_html += f'''
+                <div class="cover">
+                    <img src="{cover_path}" alt="Book Cover" class="cover-image">
+                </div>
+            '''
+        
+        toc_html += '''
                 <h1>Table of Contents</h1>
                 <ul class="toc-list">
         '''
@@ -177,6 +249,12 @@ class EPUBToHTMLConverter:
             self.book = epub.read_epub(self.epub_path)
             logger.info("Successfully loaded EPUB file")
             
+            # Extract and save images
+            self._save_images()
+            
+            # Extract cover
+            cover_path = self._extract_cover()
+            
             # Create stylesheet
             css_file = self._create_stylesheet()
             logger.info("Created stylesheet")
@@ -189,10 +267,12 @@ class EPUBToHTMLConverter:
             items = list(self.book.get_items())
             logger.info(f"Found {len(items)} items in EPUB")
             
-            # Counter for chapters
-            chapter_count = 0
+            # Process document items
             document_items = [item for item in items if item.get_type() == ebooklib.ITEM_DOCUMENT]
             total_chapters = len(document_items)
+            
+            # Counter for chapters
+            chapter_count = 0
             
             # Process each item
             for item in document_items:
@@ -202,6 +282,9 @@ class EPUBToHTMLConverter:
                     
                     # Extract content
                     content = item.get_content().decode('utf-8')
+                    
+                    # Process images in content
+                    content = self._process_images_in_content(content)
                     
                     # Parse with BeautifulSoup for clean HTML
                     soup = BeautifulSoup(content, 'html.parser')
@@ -264,8 +347,8 @@ class EPUBToHTMLConverter:
                     logger.error(f"Error processing chapter {chapter_count}: {str(e)}")
                     continue
             
-            # Create table of contents
-            self._create_toc(chapters)
+            # Create table of contents with cover
+            self._create_toc(chapters, cover_path)
             logger.info("Created table of contents")
             
             logger.info(f"Conversion complete. Generated {len(generated_files)} HTML files")
@@ -274,17 +357,7 @@ class EPUBToHTMLConverter:
         except Exception as e:
             logger.error(f"Error converting EPUB: {str(e)}")
             raise
-    
-    def _generate_filename(self, item, chapter_count):
-        """
-        Generate a clean filename for the HTML file
-        
-        :param item: EPUB spine item
-        :param chapter_count: Current chapter number
-        :return: Filename for HTML
-        """
-        return f"chapter_{chapter_count:03d}.html"
-    
+
     def get_book_metadata(self):
         """
         Extract book metadata
