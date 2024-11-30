@@ -1,0 +1,2 @@
+ebooklib==0.17.1
+beautifulsoup4==4.12.2
